@@ -11,7 +11,7 @@ This project analyzes customer behavior in an Indonesian fashion e-commerce data
 
 ## 📂 Dataset
 
-Source: [Kaggle – Produk E-commerce Indonesia](https://www.kaggle.com/datasets/safrizalardanaa/produk-ecommerce-indonesia)
+Source: [Kaggle – Fashion E-Commerce Products Indonesia](https://www.kaggle.com/datasets/safrizalardanaa/produk-ecommerce-indonesia)
 
 **Data sources used:**
 
