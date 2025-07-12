@@ -1,0 +1,728 @@
+---
+title: "STAT5125 Final Project"
+author: Jae Eun Lee, Haoxian Ruan
+format: html
+editor: visual
+---
+
+# Objective
+
+1.  Data Tidying - Transform messy data from various tables into a tidy format to facilitate further analysis.
+
+2.  Data Analysis - Analyze sales distribution across product categories and evaluate the impact of promotions from both product and business perspectives.
+
+3.  User Churn Prediction Model - Develop a churn prediction model. This involves explaining the model's principles, describing the input features used, and presenting evaluation metrics.
+
+# Dataset
+
+source: [Kaggle: Fashion Ecommerce Indonesia](https://www.kaggle.com/datasets/safrizalardanaa/produk-ecommerce-indonesia)
+
+Data Description: \[Transaction\]
+
+created_at: Transaction occurrence time, customer_id: Customer ID, booking_id: Booking ID, session_id: Session ID, payment_method: Payment method, payment_status: Payment status, promo_amount: Promotion discount amount, promo_code: Promotion code, shipment_fee: Shipment fee, shipment_date_limit: Shipment completion deadline, shipment_location_lat: Shipment location latitude, shipment_location_long: Shipment location longitude, total_amount: Total price, item_price: Item price
+
+\[Customer\]
+
+customer_id: Customer ID, first_name: First name, last_name: Last name, username: Username, email: Email, gender: Gender, birthdate: Birthdate, device_type: Device type, device_id: Device ID, device_version: Device version, home_location_lat: Home location latitude, home_location_long: Home location longitude, home_location: Home location, home_country: Home country, first_join_date: First join date
+
+\[Product\]
+
+id: ID, gender: Gender, masterCategory: Top-level category, subCategory: Sub-category, articleType: Product type, baseColour: Base color, season: Season, year: Year, usage: Usage, productDisplayName: Product name
+
+\[Click Stream\] event_name: Event name, event_time: Event occurrence time, event_id: Event ID, traffic_source: Traffic source, product_id: Product ID, quantity: Quantity, item_price: Item price, payment_status: Payment status, search_keywords: Search keywords, promo_code: Promotion code, promo_amount: Promotion discount amount
+
+```{r}
+library(tidymodels)
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+tidymodels_prefer()
+theme_set(theme_bw())
+```
+
+```{r}
+click_stream <- read.csv("data/click_stream_new.csv")
+transaction <- read.csv("data/transaction_new.csv")
+customer <- read.csv("data/customer.csv")
+product <- read.csv("data/product.csv")
+```
+
+## Visualization
+
+```{r}
+trans <- transaction |>
+  mutate(event_time = ym(substr(created_at, 1, 7)))
+#  select(-created_at)
+
+monthly_sales <- trans |>
+  select(event_time, total_amount) |>
+  group_by(event_time) |>
+  summarize(total_sales = sum(total_amount))
+
+drop_down_points <- monthly_sales |>
+  filter(total_sales < dplyr::lag(total_sales))
+
+ggplot(monthly_sales, aes(x = event_time, y = total_sales)) +
+  geom_line() +
+  geom_point(data = drop_down_points, aes(y = total_sales), shape = 21, size = 1, fill = "blue") +
+  geom_vline(xintercept = as.numeric(as.Date("2022-05-01")), color = "red", linetype = "dashed") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Sales Over Time") +
+  theme_minimal()
+```
+
+```{r}
+promo_used <- trans |>
+  mutate(promo = ifelse(promo_code != 0, 1, 0)) |>
+  group_by(event_time) |>
+  summarize(count_1_in_promo = sum(promo == 1))
+
+ggplot(promo_used, aes(x = event_time, y = count_1_in_promo)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Monthly Promo Usage",
+       x = "Date",
+       y = "Promo Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+new_cust <- customer |>
+  mutate(first_join_date = ym(substr(first_join_date, 1, 7))) |>
+  group_by(first_join_date) |>
+  summarize(new_join = n())
+
+ggplot(new_cust, aes(x = first_join_date, y = new_join)) +
+  geom_line() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_vline(xintercept = c(as.numeric(as.Date("2017-07-01")),
+                            as.numeric(as.Date("2018-07-01")),
+                            as.numeric(as.Date("2019-07-01")),
+                            as.numeric(as.Date("2020-07-01")),
+                            as.numeric(as.Date("2021-07-01"))),
+             color = "red", linetype = "dashed") +
+  labs(title = "Newly Joined Customers") +
+  theme_minimal()
+```
+
+# Preparing dataset
+
+## Training set
+
+```{r}
+click_clean <- click_stream |> 
+  mutate(time = substr(event_time, 1, 4)) |>
+  filter(event_name == 'BOOKING',
+         payment_status == "Success",
+         time == 2021) |> # extract the data in year 2021
+  select(session_id, event_time, traffic_source, payment_status) |> #deselect the columns with NA or useless values
+  mutate(event_time = substr(event_time, 1, 10))
+
+head(click_clean)
+```
+
+```{r}
+transaction_clean <- transaction |>
+  mutate(time = substr(created_at, 1, 4)) |>
+  filter(time == 2021, 
+         payment_status == "Success") |>
+  select(-c(shipment_location_lat, shipment_location_long, booking_id)) |>
+  mutate(created_at = substr(created_at, 1, 10),
+         shipment_date_limit = substr(shipment_date_limit, 1, 10))
+
+head(transaction_clean)
+```
+
+### Merge Click and Trans
+
+```{r}
+# merge the transaction data with the click_stream data
+df <- transaction_clean |>
+  merge(click_clean, by = "session_id", all.x = TRUE) |>
+  select(-(payment_status.y)) |>
+  rename(payment_status = payment_status.x)
+
+head(df)
+```
+
+```{r}
+# drop the rows with NA values
+df <- df |>
+  na.omit()
+
+head(df)
+```
+
+We will convert the date-related columns into date datatype, exclude the total_amount column due to collinearity issues, and drop the promo_code column as certain promo codes may only apply to data from 2022 and not generalize to the test set. Additionally, we will initially label all customers as churned (TRUE) and then update the churn label to FALSE for rows satisfying the non-churn condition. Finally, we will create a new shipment_eta column to capture estimated shipment times.
+
+```{r}
+df <- df |>
+  mutate(created_at = as.Date(created_at)) |>
+  mutate(shipment_date_limit = as.Date(shipment_date_limit)) |>
+  mutate(event_time = as.Date(event_time)) |>
+  arrange(event_time, session_id) |>
+  mutate(churn = TRUE) |>
+  relocate(churn, .before = "created_at") |>
+  relocate(event_time, .before = "created_at") |>
+  relocate(customer_id, .before = "created_at") |>
+  mutate(shipment_eta = as.numeric(shipment_date_limit - created_at)) |>
+  select(-c(created_at, payment_status, promo_code, shipment_date_limit, time, total_amount))
+
+head(df)
+```
+
+## Label the Target Variable
+
+The function "f1" is to get all the records of the customer_id.
+
+```{r}
+f1 <- function(id) {
+  record <- df |>
+    filter(customer_id == id)
+  return(record)
+}
+```
+
+```{r}
+# create a tibble and convert each the records of the customer_id as a tibble
+table <- tibble(customer = unique(df$customer_id)) |>
+  rowwise() |>
+  mutate(output = list(f1(customer))) |>
+  ungroup()
+
+head(table)
+```
+
+```{r}
+# unnest: to verify whether it returns to the original tibble
+table |>
+  unnest(cols = output) |>
+  head()
+```
+
+It confirms that the number of rows becomes the same as the 'df' dataset before creating the tibble.
+
+Here, "churn" is defined as customers who have not made any transactions within 30 days after their last transaction. The function "label" is to label churn in each records in each customer_id. As the definition of churn, if the customer did not make another transaction in 30 days, he/she is labelled as a churn. It's important to note that the session_id should be different, as multiple items purchased within the same transaction will have the same session_id.
+
+```{r}
+label <- function(tibble_in) {
+  n <- nrow(tibble_in)
+  if(n>1){
+    for (i in 1:(n-1)) {
+      date_1 <- tibble_in[i, "event_time"]
+      s_1 <- tibble_in[i, "session_id"]
+      for (j in (i+1):n){
+        date_2 <- tibble_in[j, "event_time"]
+        s_2 <- tibble_in[j, "session_id"]
+        if(as.logical(s_1!=s_2)&(as.numeric(date_2-date_1)<30)){
+          tibble_in[i, "churn"] = FALSE
+          next
+        }
+      }
+    }
+    }
+  return(tibble_in)
+  }
+```
+
+We optimized churn labeling in a large dataset by shifting from an inefficient O(n\^2) approach to focusing solely on records with the same customer_id, achieving a time complexity of O(m\^2), where m \< 200. This significantly improved labeling speed for datasets with over 300,000 rows. Additionally, while initially finding the course content focused on tidyverse unengaging, we later recognized its value in developing crucial problem-solving skills during the project.
+
+\[Comparing the time complexities\]
+
+Direct Labeling on the entire dataset: O(n\^2), where $n>3×10^5$
+
+Using Rowwise Labeling: O(m\^2), where $m<2×10^2$
+
+Now, apply the function to the tibble, and unnest it.
+
+```{r}
+table_1 <- table |>
+  mutate(new_output = map(output, label)) |>
+  unnest(cols = new_output)
+
+head(table_1)
+```
+
+```{r}
+# the proportion of target
+table(table_1$churn)
+```
+
+```{r}
+# drop irrelevant columns.
+table_2 <- table_1 |>
+  select(-c(output, customer))
+
+head(table_2)
+```
+
+For the 'product' data, select the relevant columns and clean it for further analysis.
+
+```{r}
+product_select <- product |>
+  select(c(id, masterCategory, season, year, usage, productDisplayName)) |>
+  filter(masterCategory != "") |>
+  filter(!is.na(usage)) |>
+  filter(usage != "") |>
+  filter(season != "") |>
+  mutate(brand = str_extract(productDisplayName, "\\w+")) |>
+  select(-c(productDisplayName))
+  
+head(product_select)
+```
+
+For customer data, we will also select the relevant columns and clean it for further analysis.
+
+```{r}
+customer_clean <- customer |>
+  select(customer_id, gender, birthdate, device_version, home_location, first_join_date) |>
+  mutate(birthdate = as.Date(birthdate),
+         device_version = str_extract(device_version, "\\w+"))
+
+head(customer_clean)
+```
+
+Let's merge the combined transaction and click_stream data with the customer and product data tables.
+
+```{r}
+final <- table_2 |>
+  mutate(product_id = as.character(product_id)) |>
+  left_join(product_select, by = c("product_id" = "id")) |>
+  left_join(customer_clean, by = c("customer_id" = "customer_id")) |>
+  mutate(first_join_date = as.Date(first_join_date),
+         age = as.integer(as.numeric(event_time-birthdate)/365),
+         member_duration = as.numeric(event_time-first_join_date)) |>
+  select(-c(birthdate, first_join_date))
+
+head(final)
+```
+
+Next, we will convert relevant variables to factor variables and drop irrelevant columns. Additionally, we will exclude data from the last month to avoid an inaccurate churn label. For example, if a customer made a transaction on December 25th, 2021, and their next transaction was on January 1st, 2022, our labeling process would incorrectly mark them as churned since we only have data for 2021. However, they did not actually churn. By removing the last month's data, we can prevent this mislabeling.
+
+```{r}
+train_set <- final |>
+  na.omit() |>
+  mutate(usage = as.factor(usage),
+         brand = as.factor(brand),
+         gender = as.factor(gender),
+         payment_method = as.factor(payment_method),
+         traffic_source = as.factor(traffic_source),
+         masterCategory = as.factor(masterCategory),
+         season = as.factor(season),
+         device_version = as.factor(device_version),
+         home_location = as.factor(home_location)) |>
+  select(-c(session_id, customer_id, product_id)) |>
+  mutate(product_year = 2021-year) |>
+  relocate(product_year, .after=year) |>
+  filter(event_time < as.numeric(as.Date("2021-12-01"))) |>
+  select(-event_time, -year, -brand, -device_version) |>
+  mutate(churn = as.factor(churn),
+         home_location = str_extract(home_location, "\\S+"))
+
+head(train_set)
+```
+
+```{r}
+library(ggplot2)
+churn_df <- as.data.frame(table(train_set$churn)) |>
+  mutate(Churn = Var1,
+         Frequency = Freq) |>
+  select(-Var1, -Freq) |>
+  mutate(Percentage = Frequency / sum(Frequency) * 100)
+
+ggplot(churn_df, aes(x = "", y = Frequency, fill = Churn)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  labs(title = "Train Churn Distribution") +
+  theme_void() +
+  geom_text(aes(label = paste0(round(Percentage), "%")), position = position_stack(vjust = 0.5))
+```
+
+This pie chart shows the balanced target ratio in training set.
+
+## Test set
+
+For the test set, we perform the same procedures in data cleaning as those applied to the training set.
+
+```{r}
+library(tidyverse)
+click_stream <- read.csv("data/click_stream_new.csv")
+transaction <- read.csv("data/transaction_new.csv")
+```
+
+```{r}
+# clean the click_stream data
+click_clean <- click_stream |> 
+  mutate(time = substr(event_time, 1, 4)) |>
+  filter(time == 2022,
+         event_name == 'BOOKING',
+         payment_status == "Success") |>
+  mutate(time = substr(event_time, 1, 10),
+         time = as.Date(time)) |>
+  filter(time < as.Date("2022-03-01")) |>
+  select(session_id, event_time, traffic_source, payment_status) |>
+  mutate(event_time = substr(event_time, 1, 10))
+  
+head(click_clean)
+```
+
+```{r}
+# clean the transaction data
+transaction_clean <- transaction |> 
+  mutate(time = substr(created_at, 1, 4)) |>
+  filter(time == 2022,
+         payment_status == "Success") |>
+  mutate(time = substr(created_at, 1, 10),
+         time = as.Date(time)) |>
+  filter(time < as.Date("2022-03-01")) |>
+  select(created_at, customer_id, session_id, payment_method, payment_status, promo_amount, promo_code, shipment_fee, shipment_date_limit, total_amount, product_id, quantity, item_price) |>
+  mutate(created_at = substr(created_at, 1, 10),
+         shipment_date_limit = substr(shipment_date_limit, 1, 10))
+
+head(transaction_clean)
+```
+
+```{r}
+# merge
+df <- transaction_clean |>
+  merge(click_clean, by = "session_id", all.x = TRUE) |>
+  select(-(payment_status.y)) |>
+  rename(payment_status = payment_status.x) |>
+  na.omit() |>
+  mutate(created_at = as.Date(created_at),
+         shipment_date_limit = as.Date(shipment_date_limit)) |>
+  mutate(event_time = as.Date(event_time),
+         shipment_eta = as.numeric(shipment_date_limit - created_at)) |>
+  arrange(event_time, session_id) |>
+  mutate(churn = TRUE) |>
+  relocate(churn, event_time, customer_id, .before = "created_at") |>
+  select(-c(created_at, payment_status, promo_code, shipment_date_limit, total_amount))
+
+head(df)
+```
+
+```{r}
+table <- tibble(customer = unique(df$customer_id)) |>
+  rowwise() |>
+  mutate(output = list(f1(customer))) |>
+  ungroup()
+
+head(table)
+```
+
+```{r}
+table |>
+  unnest(cols = output) |>
+  head()
+```
+
+```{r}
+table_1 <- table |>
+  mutate(new_output = map(output, label)) |>
+  unnest(cols = new_output)
+
+head(table_1)
+```
+
+```{r}
+table(table_1$churn)
+```
+
+```{r}
+table_2 <- table_1 |>
+  select(-c(output, customer)) |>
+  filter(event_time < as.Date("2022-02-01"))
+
+head(table_2)
+```
+
+```{r}
+final <- table_2 |>
+  mutate(product_id = as.character(product_id)) |>
+  left_join(product_select, by = c("product_id" = "id")) |>
+  left_join(customer_clean, by = c("customer_id" = "customer_id")) |>
+  mutate(first_join_date = as.Date(first_join_date),
+         age = as.integer(as.numeric(event_time-birthdate)/365),
+         member_duration = as.numeric(event_time-first_join_date)) |>
+  select(-c(birthdate, first_join_date))
+
+head(final)
+```
+
+```{r}
+data <- final |>
+  na.omit() |>
+  mutate(usage = as.factor(usage),
+         brand = as.factor(brand),
+         gender = as.factor(gender),
+         payment_method = as.factor(payment_method),
+         traffic_source = as.factor(traffic_source),
+         masterCategory = as.factor(masterCategory),
+         season = as.factor(season),
+         device_version = as.factor(device_version),
+         home_location = as.factor(home_location)) |>
+  select(-c(session_id, customer_id, product_id))
+  
+head(data)
+```
+
+```{r}
+data <- data |>
+  mutate(churn = as.factor(churn))
+
+head(data)
+```
+
+```{r}
+test_set <- data |>
+  mutate(product_year = 2021-year) |>
+  relocate(product_year, .after=year) |>
+  select(-event_time, -year, -brand, -device_version) |>
+  mutate(churn = as.factor(churn),
+         home_location = str_extract(home_location, "\\S+"))
+
+head(test_set)
+```
+
+```{r}
+library(ggplot2)
+churn_df <- as.data.frame(table(test_set$churn)) |>
+  mutate(Churn = Var1,
+         Frequency = Freq) |>
+  select(-Var1, -Freq) |>
+  mutate(Percentage = Frequency / sum(Frequency) * 100)
+
+ggplot(churn_df, aes(x = "", y = Frequency, fill = Churn)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  labs(title = "Test Churn Distribution") +
+  theme_void() +
+  geom_text(aes(label = paste0(round(Percentage), "%")), position = position_stack(vjust = 0.5))
+```
+
+This pie chart also shows the balanced target ratio in test set.
+
+```{r}
+write.csv(train_set, file = "data/train.csv", row.names = FALSE)
+write.csv(test_set, file = "data/test.csv", row.names = FALSE)
+```
+
+Here's the period we used for training and test: training set: 2021-01 \~ 2021-12
+
+test set: 2022-01
+
+```{r}
+train <- read.csv("data/train.csv") |>
+  mutate(churn = as.factor(churn))
+head(train)
+
+test <- read.csv("data/test.csv") |>
+  mutate(churn = as.factor(churn))
+head(test)
+```
+
+# Modeling
+
+## Model 1
+
+**logistic regression** with all variables: A logistic regression, fit using maximum likelihood, with churn as the response and all other variables as explanatory variables. The recipe normalizes all the numeric predictors. Moreover, it replace any home_location that occurs in less than 1 percent of the data with an "other" category.
+
+```{r}
+recipe_1 <- recipe(data = train,
+                   formula = churn ~ .) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_other(home_location,
+             threshold = 0.01,
+             other = "other")
+
+parsnip_1 <- logistic_reg() |>
+  set_mode("classification") |>
+  set_engine("glm")
+
+workflow_1 <- workflow() |>
+  add_model(parsnip_1) |>
+  add_recipe(recipe_1)
+```
+
+```{r}
+glm_fit <- workflow_1 |>
+  fit(data = train)
+
+glm_fit
+```
+
+```{r}
+library(yardstick)
+glm_predict <- predict(glm_fit,
+                       test,
+                       type = "class")
+
+df1 <- data.frame(tru = test$churn, est = glm_predict$.pred_class)
+confusion_mat <- conf_mat(df1, truth = tru, estimat = est)
+
+confusion_mat
+```
+
+```{r}
+acc <- accuracy(df1, truth = tru, estimat = est)
+acc
+```
+
+## Model 2
+
+A logistic regression, fit using the **lasso with a penalty = 0.1**, with arr_delay_over_30 as the response and all other variables as explanatory variables. Use the same recipe as in A. Call this workflow workflow_B.
+
+```{r}
+parsnip_2 <- logistic_reg(penalty = 0.01) |> 
+  set_mode("classification") |>
+  set_engine("glmnet")
+
+workflow_2 <- workflow() |>
+  add_model(parsnip_2) |>
+  add_formula(churn ~ .)
+```
+
+```{r}
+glmnet_fit <- workflow_2 |>
+  fit(data = train)
+
+glmnet_fit
+```
+
+```{r}
+glmnet_predict <- predict(glmnet_fit,
+                       test,
+                       type = "class")
+
+df2 <- data.frame(tru = test$churn, est = glmnet_predict$.pred_class)
+confusion_mat <- conf_mat(df1, truth = tru, estimat = est)
+
+confusion_mat
+```
+
+```{r}
+acc2 <- accuracy(df2, truth = tru, estimat = est)
+acc2
+```
+
+## Model 3
+
+A logistic regression, fit using the **top 5 principal components** of the remaining numerical variables.
+
+```{r}
+parsnip_3 <- logistic_reg() |> 
+  set_mode("classification") |>
+  set_engine("glm")
+
+recipe_3 <- recipe(churn ~ .,
+                   data = train) |> 
+  step_normalize(all_numeric_predictors()) |>
+  step_other(home_location,
+             threshold = 0.01,
+             other = "other") |>
+  step_pca(all_numeric_predictors(), 
+           num_comp = 5) |> 
+  step_dummy(all_nominal_predictors())
+  
+
+workflow_3 <- workflow() |>
+  add_model(parsnip_3) |>
+  add_recipe(recipe_3)
+```
+
+```{r}
+glm_fit_pca <- workflow_3 |>
+  fit(data = train)
+
+glm_fit_pca
+```
+
+```{r}
+glm_pca_predict <- predict(glm_fit_pca,
+                       test,
+                       type = "class")
+
+df3 <- data.frame(tru = test$churn, est = glm_pca_predict$.pred_class)
+confusion_mat <- conf_mat(df3, truth = tru, estimat = est)
+
+confusion_mat
+```
+
+```{r}
+acc3 <- accuracy(df3, truth = tru, estimat = est)
+acc3
+```
+
+# Predictions
+
+```{r}
+workflow_names <- c("logsitic",
+                    "logistic_lasso",
+                    "logistic_pca")
+
+workflow_objects <- list(workflow_1,
+                         workflow_2,
+                         workflow_3)
+
+workflows_tbl <- tibble(work_names = workflow_names,
+                        work_objects = workflow_objects)
+
+workflows_tbl
+```
+
+```{r}
+accuracy <- tibble(Model = c("Model1", "Model2", "Model3"),
+                   Accuracy = c(0.6201111,0.6212444,0.6199729))
+
+accuracy
+```
+
+*Model 3*, using logistic regression with **lasso with a penalty = 0.1**, has the highest accuracy here.
+
+```{r}
+set.seed(1)
+workflows_tbl <- workflows_tbl |>
+  rowwise() |>
+  mutate(fits = list(fit(work_objects, 
+                         train)))
+```
+
+```{r}
+workflows_resub_prob <- workflows_tbl |>
+  mutate(predictions = list(predict(fits,
+                                    train,
+                                    type = "prob")))
+
+predictions_resub  <- workflows_resub_prob |>
+  select(work_names, 
+         predictions) |>
+  unnest(cols = c(predictions)) |>
+  cbind(churn = train |>
+          pull(churn))
+```
+
+```{r}
+roc_all <- predictions_resub |>
+  group_by(work_names) |>
+  roc_curve(truth = churn,
+            .pred_TRUE,
+            event_level = "second")
+
+roc_all |>
+  ggplot(aes(x = 1- specificity, 
+             y = sensitivity, 
+             color = work_names)) +
+  geom_path() +
+  theme(legend.position = "top")
+```
+
+The ROC graph's almost linear pattern indicates that the AUC score close to 0.5. It reflects poor model performance suggesting classification performance not significantly better than random guessing.
+
+# Conclusion
+
+The AUC score close to 0.5 for the evaluated models indicates poor predictive performance, essentially suggesting random classification. Although the logistic_lasso model demonstrated slightly higher accuracy compared to others, the ROC curve analysis revealed instances where the AUC fell below 0.5, further highlighting the limitations of the models. Selecting the best model remains challenging at this point.
+
+In a real-world scenario, these findings have practical significance for the company. Deploying models with poor predictive performance could lead to ineffective decision-making and wasted resources. For example, in a customer churn prediction scenario, relying on inaccurate models may result in misidentification of at-risk customers, leading to ineffective retention strategies and potential loss of revenue.
+
+However, there is an opportunity for improvement. Conducting feature engineering to create additional features, fine-tuning model parameters, or exploring alternative algorithms could enhance predictive performance. By investing in further analysis and modeling efforts, the company can develop a more robust and effective solution for predicting customer behavior, ultimately leading to better-informed decision-making and improved business outcomes.
