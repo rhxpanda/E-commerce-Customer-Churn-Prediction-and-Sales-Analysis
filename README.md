@@ -36,13 +36,25 @@ Source: [Kaggle – Fashion E-Commerce Products Indonesia](https://www.kaggle.co
 Churn is defined as:  
 > A customer is considered churned if they made **no purchases within 30 days** after a transaction.
 
-### Optimization
-To efficiently label churn:
-- Original method: O(n²) (too slow for 300,000+ rows)
-- Improved method: O(m²) per customer group (`m` ≪ `n`), using `rowwise()` and `map()`
+To generate churn labels efficiently, we created a custom labeling function that groups by user and compares session timestamps — reducing time complexity from **O(n²)** to **O(m²)** per user.
 
-### Features Used:
-- `payment_method`, `promo_amount`, `traffic_source`, `shipment_eta`, etc.
+### ⚙️ Modeling Workflow
+
+We used the [`tidymodels`](https://www.tidymodels.org/) framework in R, with the following setup:
+
+- **Preprocessing:** `recipe()` for dummy encoding and normalization  
+- **Split:** `initial_split()` to divide training and testing sets  
+- **Model:** `logistic_reg()` from `parsnip` with `glm` engine  
+- **Evaluation:** `metrics = metric_set(accuracy, roc_auc)`  
+- **Final Fit:** `last_fit()` for performance on unseen test data
+
+### 📌 Features used in modeling
+
+- `promo_amount`  
+- `payment_method`  
+- `traffic_source`  
+- `shipment_eta`  
+- Session timing & frequency 
 
 ## ✅ Results
 
